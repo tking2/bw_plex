@@ -17,6 +17,7 @@ import plexapi
 
 import requests
 from sqlalchemy.orm.exc import NoResultFound
+from sqlalchemy.sql import and_
 
 from bw_plex import FP_HASHES, CONFIG, THEMES, LOG, INI_FILE, PMS, POOL, Pool
 from bw_plex.config import read_or_make
@@ -265,9 +266,10 @@ def cli(debug, username, password, servername, url, token, config, verify_ssl, d
     url = url or CONFIG['server'].get('url')
     token = token or CONFIG['server'].get('token')
     verify_ssl = verify_ssl or CONFIG['server'].get('verify_ssl')
+    username = username or CONFIG['server'].get('username')
+    password = password or CONFIG['server'].get('password')
 
     if url and token or username and password:
-
         PMS = get_pms(url=url, token=token,
                       username=username,
                       password=password,
@@ -946,10 +948,12 @@ def client_action(offset=None, sessionkey=None, action='jump'):  # pragma: no co
 
             if correct_client:
                 try:
-                    LOG.info('Connectiong to %s', correct_client.title)
-                    correct_client.connect()
-                except (requests.exceptions.ConnectionError):
-                    LOG.exception('Cant connect to %s', client.title)
+                    LOG.info('Connecting to %s', correct_client.title)
+                    # No need to connect for Chromecast
+                    if not correct_client.title == "Chromecast":
+                        correct_client.connect()
+                except Exception:
+                    LOG.exception('Cant connect to %s, will still try', client.title)
                     # Lets just skip this for now and some "clients"
                     # might be controllable but not support the /resources endpoint
                     # https://github.com/Hellowlol/bw_plex/issues/74
@@ -1092,6 +1096,20 @@ def check(data):
             try:
                 item = se.query(Processed).filter_by(ratingKey=ratingkey).one()
 
+                episode = PMS.getEpisode(ratingkey)
+                show_name = episode.grandparentTitle
+                season = episode.parentTitle
+
+                # Attempt to find a season/show override in that order
+                override_item = se.query(Processed).filter(and_(Processed.show_name==show_name,
+                                                                Processed.title.in_([None, season]),
+                                                                Processed.type.in_(["show", "season"]))).order_by(Processed.title.desc()).first()
+
+                if override_item:
+                    LOG.debug("Found %s override for %s, using this to determine start/end",
+                              override_item.type, override_item.prettyname)
+                    item = override_item if override_item else item
+
                 if item:
                     bt = best_time(item)
                     LOG.debug('Found %s theme start %s, theme end %s, ffmpeg_end %s progress %s '
@@ -1121,12 +1139,12 @@ def check(data):
                     # This mode will allow playback until the theme starts so it should be faster then skip_if_recap.
                     if mode == 'skip_only_theme':
                         # For manual corrected themes..
-                        if item.type == 'episode' and item.correct_theme_end and item.correct_theme_start:
+                        if item.type in ['episode', 'show', 'season'] and item.correct_theme_end and item.correct_theme_start:
                             if progress > item.correct_theme_start and progress < item.correct_theme_end:
                                 LOG.debug('%s is in the correct time range correct_theme_end', item.prettyname)
                                 return jump(item, sessionkey, item.correct_theme_end)
 
-                        elif item.type == 'episode' and item.theme_end and item.theme_start:
+                        elif item.type  in ['episode', 'show', 'season'] and item.theme_end and item.theme_start:
                             if progress > item.theme_start and progress < item.theme_end:
                                 LOG.debug('%s is in the correct time range theme_end', item.prettyname)
                                 return jump(item, sessionkey, item.theme_end)
@@ -1137,6 +1155,8 @@ def check(data):
                     LOG.debug('Failed to find ratingkey %s in the db', ratingkey)
                     ret = POOL.apply_async(task, args=(ratingkey, sessionkey))
                     return ret
+            except Exception as e:
+                LOG.error("Error sighted: {}".format(e))
 
     elif data.get('type') == 'timeline':
         timeline = data.get('TimelineEntry')[0]
@@ -1273,6 +1293,77 @@ def set_manual_theme_time(showname, season, episode, type, start, end):  # pragm
 
                 LOG.debug('Set correct_time %s for %s to start %s end %s',
                           type, ep._prettyfilename(), start, end)
+
+
+@cli.command()
+@click.argument('showname')
+@click.argument('start')
+@click.argument('end')
+@click.argument('type', default='theme')
+@click.argument('season', type=int, default=0)
+def set_manual_show_time(showname, season, type, start, end):  # pragma: no cover
+    """Set a manual start and end time for a show or show + season
+
+       Args:
+           showname(str): name of the show you want to find
+           season(int): season number fx 1 (optional)
+           type(str): theme, credit # Still TODO Stuff for credits
+           start(int, str): This can be in seconds or MM:SS format
+           start(int, str): This can be in seconds or MM:SS format
+
+       Returns:
+            None
+    """
+    LOG.debug('Trying to set manual time')
+    result = PMS.search(showname)
+
+    if result:
+
+        items = choose('Select show', result, 'title')
+        show = items[0]
+
+        sn = show.season(season) if season else None
+        title = season if sn else None
+        type = "season" if sn else "show"
+        prettyname = showname + (sn.title if sn else "")
+
+        with session_scope() as se:
+            item = se.query(Processed).filter(and_(Processed.type==type,
+                                                   Processed.show_name==showname,
+                                                   Processed.title==title)).first()
+            if not item:
+                # It doesn't exist, add it manually
+                # Do we need to populate anything else?
+                item = Processed(type=type,
+                                 show_name=showname,
+                                 title=title,
+                                 prettyname=prettyname)
+                se.add(item)
+            start = to_sec(start)
+            end = to_sec(end)
+
+            if type == 'ffmpeg':
+                item.ffmpeg_end = end
+                item.ffmpeg_end_str = to_time(end)
+
+            elif type == 'theme':
+                if start:
+                    item.theme_start = start
+                    item.theme_start_str = to_time(start)
+                if end:
+                    item.theme_end = end
+                    item.theme_end = to_time(end)
+            elif type == 'credits':
+                if start:
+                    item.credits_start = start
+                    itme.credits_end_str = to_time(start)
+                if end:
+                    item.credits_end = end
+                    item.credits_end_str = to_time(end)
+
+            LOG.debug('Set time %s for %s to start %s end %s',
+                      type, prettyname, start, end)
+
 
 
 def real_main():

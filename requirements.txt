@@ -20,6 +20,9 @@ youtube-dl
 beautifulsoup4
 html5lib
 tablib
+pillow
+
+swig
 
 
 
@@ -27,6 +30,3 @@ tablib
 
 # Any more i have forgotten?
 # just pip until your have fixed the errors xD
-
-
-
